@@ -3,16 +3,16 @@ This training script can be run both on a single gpu in debug mode,
 and also in a larger training run with distributed data parallel (ddp).
 
 To run on a single GPU, example:
-$ python train.py --batch_size=32 --compile=False
+$ python train_drift_adaptive.py --batch_size=32 --compile=False
 
 To run with DDP on 4 gpus on 1 node, example:
-$ torchrun --standalone --nproc_per_node=4 train.py
+$ torchrun --standalone --nproc_per_node=4 train_drift_adaptive.py
 
 To run with DDP on 4 gpus across 2 nodes, example:
 - Run on the first (master) node with example IP 123.456.123.456:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
+$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train_drift_adaptive.py
 - Run on the worker node:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
+$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train_drift_adaptive.py
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 """
 
@@ -66,12 +66,40 @@ optimizer_type = 'adamw' # 'adamw' or 'sgd'
 sgd_momentum = 0.9
 sgd_nesterov = False
 # optional post-step parameter noise
-noise_type = 'none' # 'none', 'drift-power-opposed', or 'drift-power-random-norm-matched'
+# Supported:
+# - 'none'
+# - 'drift-power-opposed'
+# - 'drift-power-random-norm-matched'
+# - 'drift-power-opposed-adaptive'
+# - 'drift-power-opposed-layerwise-adaptive'
+# - 'drift-power-opposed-layerwise-relative'
+# - 'drift-inv-opposed-layerwise-relative'
+# - 'drift-gated-opposed-layerwise-relative'
+noise_type = 'none'
 noise_scale = 0.0
 noise_power = 0.5
 noise_start_iter = 0
 noise_clip_rms_mult = 0.0
 noise_eps = 1e-12
+# inverse-weighting params (used when noise_type='drift-inv-opposed-layerwise-relative')
+noise_inv_power = 0.3   # q: w_i = (|d_i| + eps)^{-q}
+noise_inv_wmin = 0.01   # floor clip
+noise_inv_wmax = 100.0  # cap clip
+# gated noise params (used when noise_type='drift-gated-opposed-layerwise-relative')
+# gate: apply noise only where |g_i| > noise_gate_tau * |d_{k,i}|
+# targets params where current gradient > tau * accumulated drift (momentum not overshot)
+noise_gate_tau = 0.1    # threshold: fraction of drift magnitude
+# adaptive-lambda controller (used when noise_type='drift-power-opposed-adaptive')
+noise_adaptive_target_ratio = 0.5  # target ||noise|| / ||optimizer_step||
+noise_adaptive_k = 0.01
+noise_adaptive_min_scale = 1e-5
+noise_adaptive_max_scale = 5e-2
+noise_adaptive_ema_beta = 0.0      # 0 = no EMA smoothing
+noise_adaptive_start_iter = 0      # delay controller updates while still injecting noise
+noise_adaptive_ratio_clip = 1e6    # clamp measured ratio before EMA/control
+
+# layerwise controller cadence (used when noise_type='drift-power-opposed-layerwise-adaptive')
+noise_layerwise_update_interval = 50
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
@@ -280,6 +308,19 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
+def quantiles_10_50_90(values):
+    vals = [float(v) for v in values if math.isfinite(float(v))]
+    if not vals:
+        nan = float("nan")
+        return nan, nan, nan
+    vals.sort()
+    n = len(vals)
+    def q(frac):
+        idx = int(round(frac * (n - 1)))
+        idx = max(0, min(n - 1, idx))
+        return vals[idx]
+    return q(0.1), q(0.5), q(0.9)
+
 def inject_parameter_noise_opposed(
     model,
     optimizer,
@@ -288,29 +329,74 @@ def inject_parameter_noise_opposed(
     noise_power: float,
     clip_rms_mult: float,
     eps: float,
+    layerwise_scales=None,
+    layerwise_ratio_ema=None,
+    layerwise_target_ratio: float = 0.0,
+    layerwise_k: float = 0.0,
+    layerwise_min_scale: float = 0.0,
+    layerwise_max_scale: float = 0.0,
+    layerwise_ema_beta: float = 0.0,
+    update_layerwise_controller: bool = False,
+    layerwise_ratio_clip: float = 1e6,
 ):
     if noise_type == 'none' or noise_scale <= 0.0:
-        return 0.0
-    if noise_type not in ('drift-power-opposed', 'drift-power-random-norm-matched'):
+        return 0.0, 0.0, 0.0
+    if noise_type not in (
+        'drift-power-opposed',
+        'drift-power-random-norm-matched',
+        'drift-power-opposed-adaptive',
+        'drift-power-opposed-layerwise-adaptive',
+        'drift-power-opposed-layerwise-relative',
+        'drift-inv-opposed-layerwise-relative',
+        'drift-gated-opposed-layerwise-relative',
+    ):
         raise ValueError(
             f"unknown noise_type={noise_type!r}, expected "
-            "'none', 'drift-power-opposed', or 'drift-power-random-norm-matched'"
+            "'none', 'drift-power-opposed', 'drift-power-random-norm-matched', "
+            "'drift-power-opposed-adaptive', or "
+            "'drift-power-opposed-layerwise-adaptive', or "
+            "'drift-power-opposed-layerwise-relative', or "
+            "'drift-inv-opposed-layerwise-relative'"
         )
 
     if noise_power < 0.0:
         raise ValueError(f"noise_power must be >= 0, got {noise_power}")
 
     param_to_momentum = {}
+    param_to_lr = {}
     for group in optimizer.param_groups:
         mu = float(group.get('momentum', 0.0))
+        lr = float(group.get('lr', 0.0))
         for p in group['params']:
             param_to_momentum[p] = mu
+            param_to_lr[p] = lr
 
     perturbations = {}
     total_norm_sq = 0.0
     param_norm_sq = 0.0
+    step_norm_sq = 0.0
+    gate_total = 0
+    gate_active = 0
+    layerwise_mode = (noise_type == 'drift-power-opposed-layerwise-adaptive')
+    layerwise_relative_mode = noise_type in (
+        'drift-power-opposed-layerwise-relative',
+        'drift-inv-opposed-layerwise-relative',
+        'drift-gated-opposed-layerwise-relative',
+    )
 
-    for _, param in model.named_parameters():
+    if layerwise_mode and (layerwise_scales is None or layerwise_ratio_ema is None):
+        raise ValueError(
+            "layerwise_scales and layerwise_ratio_ema must be provided for "
+            "drift-power-opposed-layerwise-adaptive"
+        )
+
+    if layerwise_mode:
+        layerwise_ema_beta = float(max(0.0, min(0.9999, layerwise_ema_beta)))
+        layerwise_ratio_clip = float(layerwise_ratio_clip)
+        if layerwise_ratio_clip <= 0.0:
+            layerwise_ratio_clip = 1e-12
+
+    for name, param in model.named_parameters():
         g = param.grad
         if g is None:
             continue
@@ -342,6 +428,22 @@ def inject_parameter_noise_opposed(
                 perturbation = z_rand * (opp_norm / z_rand_norm)
             else:
                 perturbation = torch.zeros_like(param)
+        elif noise_type == 'drift-inv-opposed-layerwise-relative':
+            # Inverse drift weighting: louder for stuck params, quieter for active ones.
+            # w_i = clip((|d_i| + eps)^{-q}, w_min, w_max)
+            # perturbation = -sign(d) * w  (then renormalized layerwise)
+            w = torch.pow(torch.abs(drift) + eps, -noise_inv_power)
+            w = torch.clamp(w, min=noise_inv_wmin, max=noise_inv_wmax)
+            perturbation = -torch.sign(drift) * w
+        elif noise_type == 'drift-gated-opposed-layerwise-relative':
+            # Gated noise: only inject where current gradient > tau * drift magnitude.
+            # Gate fires where momentum has NOT overshot the gradient.
+            # gate_i = 1 if |g_i| > tau * |d_{k,i}|, else 0
+            # perturbation = -sign(d) * gate  (then renormalized layerwise)
+            gate = (torch.abs(g.detach()) > noise_gate_tau * torch.abs(drift)).float()
+            gate_active += int(gate.sum().item())
+            gate_total += gate.numel()
+            perturbation = -torch.sign(drift) * gate
         else:
             z = torch.randn_like(param)
             perturbation = -torch.sign(drift) * mag * torch.abs(z)
@@ -349,19 +451,83 @@ def inject_parameter_noise_opposed(
             continue
 
         perturbations[param] = perturbation
-        total_norm_sq += perturbation.pow(2).sum().item()
-        param_norm_sq += param.data.pow(2).sum().item()
+        lr_param = float(param_to_lr.get(param, 0.0))
+        drift_step_norm_sq = (drift * lr_param).pow(2).sum().item()
+        step_norm_sq += drift_step_norm_sq
 
+        if layerwise_relative_mode:
+            step_norm_l = drift_step_norm_sq ** 0.5
+            target_norm_l = float(noise_scale) * step_norm_l
+            total_norm_sq += target_norm_l * target_norm_l
+
+            current_norm_l = perturbation.norm().item()
+            if current_norm_l > 1e-12 and target_norm_l > 0.0:
+                alpha_l = target_norm_l / current_norm_l
+                perturbation = perturbation * alpha_l
+            else:
+                perturbation = torch.zeros_like(param)
+            perturbations[param] = perturbation
+        elif layerwise_mode:
+            scale_l = float(layerwise_scales.get(name, noise_scale))
+            if not math.isfinite(scale_l):
+                scale_l = float(noise_scale)
+            scale_l = max(float(layerwise_min_scale), min(float(layerwise_max_scale), scale_l))
+            layerwise_scales[name] = scale_l
+
+            current_norm_l = perturbation.norm().item()
+            param_norm_l = param.data.norm().item()
+            target_norm_l = scale_l * param_norm_l
+            total_norm_sq += target_norm_l * target_norm_l
+
+            if current_norm_l > 1e-12 and target_norm_l > 0.0:
+                alpha_l = target_norm_l / current_norm_l
+                perturbation = perturbation * alpha_l
+            else:
+                perturbation = torch.zeros_like(param)
+            perturbations[param] = perturbation
+
+            if update_layerwise_controller and drift_step_norm_sq > 1e-24 and target_norm_l > 0.0:
+                step_norm_l = drift_step_norm_sq ** 0.5
+                ratio_l = target_norm_l / step_norm_l
+                if math.isfinite(ratio_l):
+                    ratio_l = max(0.0, min(layerwise_ratio_clip, ratio_l))
+                else:
+                    continue
+                prev_ema = layerwise_ratio_ema.get(name)
+                if prev_ema is None:
+                    ema_l = ratio_l
+                else:
+                    ema_l = layerwise_ema_beta * prev_ema + (1.0 - layerwise_ema_beta) * ratio_l
+                layerwise_ratio_ema[name] = ema_l
+                err_l = float(layerwise_target_ratio) - ema_l
+                next_scale_l = scale_l * math.exp(float(layerwise_k) * err_l)
+                next_scale_l = max(
+                    float(layerwise_min_scale),
+                    min(float(layerwise_max_scale), next_scale_l),
+                )
+                if math.isfinite(next_scale_l):
+                    layerwise_scales[name] = next_scale_l
+        else:
+            total_norm_sq += perturbation.pow(2).sum().item()
+            param_norm_sq += param.data.pow(2).sum().item()
+
+    gate_frac = (gate_active / gate_total) if gate_total > 0 else 0.0
     current_norm = total_norm_sq ** 0.5
     if current_norm < 1e-12:
-        return 0.0
+        return 0.0, step_norm_sq ** 0.5, gate_frac
+
+    if layerwise_mode or layerwise_relative_mode:
+        with torch.no_grad():
+            for param, perturbation in perturbations.items():
+                param.add_(perturbation)
+        return total_norm_sq ** 0.5, step_norm_sq ** 0.5, gate_frac
 
     target_norm = noise_scale * (param_norm_sq ** 0.5)
     alpha = target_norm / current_norm
     with torch.no_grad():
         for param, perturbation in perturbations.items():
             param.add_(perturbation, alpha=alpha)
-    return target_norm
+    return target_norm, step_norm_sq ** 0.5, gate_frac
 
 # logging
 if wandb_log and master_process:
@@ -374,6 +540,57 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+adaptive_noise_type = (noise_type == 'drift-power-opposed-adaptive')
+layerwise_adaptive_noise_type = (noise_type == 'drift-power-opposed-layerwise-adaptive')
+layerwise_relative_noise_type = noise_type in (
+    'drift-power-opposed-layerwise-relative',
+    'drift-inv-opposed-layerwise-relative',
+    'drift-gated-opposed-layerwise-relative',
+)
+adaptive_noise_scale = float(noise_scale)
+adaptive_ratio_ema = None
+layerwise_noise_scales = {}
+layerwise_ratio_emas = {}
+if adaptive_noise_type:
+    if noise_adaptive_min_scale <= 0.0 or noise_adaptive_max_scale <= 0.0:
+        raise ValueError(
+            "noise_adaptive_min_scale and noise_adaptive_max_scale must be > 0"
+        )
+    if noise_adaptive_min_scale > noise_adaptive_max_scale:
+        raise ValueError(
+            f"noise_adaptive_min_scale={noise_adaptive_min_scale} cannot exceed "
+            f"noise_adaptive_max_scale={noise_adaptive_max_scale}"
+        )
+    adaptive_noise_scale = max(
+        float(noise_adaptive_min_scale),
+        min(float(noise_adaptive_max_scale), adaptive_noise_scale),
+    )
+    if noise_adaptive_start_iter < noise_start_iter:
+        raise ValueError(
+            f"noise_adaptive_start_iter={noise_adaptive_start_iter} must be >= "
+            f"noise_start_iter={noise_start_iter}"
+        )
+    if noise_adaptive_ratio_clip <= 0.0:
+        raise ValueError("noise_adaptive_ratio_clip must be > 0")
+if layerwise_adaptive_noise_type:
+    if noise_adaptive_min_scale <= 0.0 or noise_adaptive_max_scale <= 0.0:
+        raise ValueError(
+            "noise_adaptive_min_scale and noise_adaptive_max_scale must be > 0"
+        )
+    if noise_adaptive_min_scale > noise_adaptive_max_scale:
+        raise ValueError(
+            f"noise_adaptive_min_scale={noise_adaptive_min_scale} cannot exceed "
+            f"noise_adaptive_max_scale={noise_adaptive_max_scale}"
+        )
+    if noise_layerwise_update_interval <= 0:
+        raise ValueError("noise_layerwise_update_interval must be >= 1")
+    if noise_adaptive_start_iter < noise_start_iter:
+        raise ValueError(
+            f"noise_adaptive_start_iter={noise_adaptive_start_iter} must be >= "
+            f"noise_start_iter={noise_start_iter}"
+        )
+    if noise_adaptive_ratio_clip <= 0.0:
+        raise ValueError("noise_adaptive_ratio_clip must be > 0")
 while True:
 
     # determine and set the learning rate for this iteration
@@ -386,13 +603,18 @@ while True:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
-            wandb.log({
+            wb_payload = {
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
-            })
+            }
+            if adaptive_noise_type:
+                wb_payload["noise/scale"] = adaptive_noise_scale
+                if adaptive_ratio_ema is not None:
+                    wb_payload["noise/ratio_ema"] = adaptive_ratio_ema
+            wandb.log(wb_payload)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -433,16 +655,59 @@ while True:
     scaler.step(optimizer)
     scaler.update()
     noise_norm = 0.0
+    noise_ratio = float("nan")
+    gate_frac_log = float("nan")
+    effective_noise_scale = float(noise_scale)
     if iter_num >= noise_start_iter:
-        noise_norm = inject_parameter_noise_opposed(
+        update_layerwise_controller = False
+        if adaptive_noise_type:
+            effective_noise_scale = adaptive_noise_scale
+        elif layerwise_adaptive_noise_type:
+            if iter_num >= noise_adaptive_start_iter:
+                update_layerwise_controller = (
+                    ((iter_num - noise_adaptive_start_iter) % int(noise_layerwise_update_interval)) == 0
+                )
+        noise_norm, step_norm, gate_frac_log = inject_parameter_noise_opposed(
             raw_model,
             optimizer,
             noise_type=noise_type,
-            noise_scale=noise_scale,
+            noise_scale=effective_noise_scale,
             noise_power=noise_power,
             clip_rms_mult=noise_clip_rms_mult,
             eps=noise_eps,
+            layerwise_scales=layerwise_noise_scales,
+            layerwise_ratio_ema=layerwise_ratio_emas,
+            layerwise_target_ratio=float(noise_adaptive_target_ratio),
+            layerwise_k=float(noise_adaptive_k),
+            layerwise_min_scale=float(noise_adaptive_min_scale),
+            layerwise_max_scale=float(noise_adaptive_max_scale),
+            layerwise_ema_beta=float(noise_adaptive_ema_beta),
+            update_layerwise_controller=update_layerwise_controller,
+            layerwise_ratio_clip=float(noise_adaptive_ratio_clip),
         )
+        if step_norm > 1e-12 and noise_norm > 0.0:
+            noise_ratio = noise_norm / step_norm
+            if math.isfinite(noise_ratio):
+                noise_ratio = max(0.0, min(float(noise_adaptive_ratio_clip), noise_ratio))
+            else:
+                noise_ratio = float("nan")
+            if adaptive_noise_type:
+                beta = float(noise_adaptive_ema_beta)
+                beta = max(0.0, min(0.9999, beta))
+                if adaptive_ratio_ema is None:
+                    adaptive_ratio_ema = noise_ratio
+                else:
+                    adaptive_ratio_ema = beta * adaptive_ratio_ema + (1.0 - beta) * noise_ratio
+                if iter_num >= noise_adaptive_start_iter:
+                    ratio_for_ctrl = adaptive_ratio_ema
+                    err = float(noise_adaptive_target_ratio) - ratio_for_ctrl
+                    next_scale = effective_noise_scale * math.exp(float(noise_adaptive_k) * err)
+                    next_scale = max(
+                        float(noise_adaptive_min_scale),
+                        min(float(noise_adaptive_max_scale), next_scale),
+                    )
+                    if math.isfinite(next_scale):
+                        adaptive_noise_scale = next_scale
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
@@ -457,7 +722,28 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, noise {noise_norm:.3e}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        nscale_label = "nscale"
+        layerwise_suffix = ""
+        if layerwise_adaptive_noise_type:
+            nscale_label = "base_nscale"
+            s10, s50, s90 = quantiles_10_50_90(layerwise_noise_scales.values())
+            r10, r50, r90 = quantiles_10_50_90(layerwise_ratio_emas.values())
+            layerwise_suffix = (
+                f", lscale[p10/p50/p90]={s10:.2e}/{s50:.2e}/{s90:.2e}, "
+                f"lratio_ema[p10/p50/p90]={r10:.2f}/{r50:.2f}/{r90:.2f}, "
+                f"nlayers={len(layerwise_noise_scales)}"
+            )
+        elif layerwise_relative_noise_type:
+            nscale_label = "rel_lambda"
+        gate_suffix = ""
+        if noise_type == 'drift-gated-opposed-layerwise-relative' and math.isfinite(gate_frac_log):
+            gate_suffix = f", gate_frac {gate_frac_log:.3f}"
+        print(
+            f"iter {iter_num}: loss {lossf:.4f}, noise {noise_norm:.3e}, "
+            f"{nscale_label} {effective_noise_scale:.3e}, ratio {noise_ratio:.3e}, "
+            f"time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%"
+            f"{layerwise_suffix}{gate_suffix}"
+        )
     iter_num += 1
     local_iter_num += 1
 
