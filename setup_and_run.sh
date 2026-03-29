@@ -61,12 +61,20 @@ PID=$!
 echo "Training running with PID $PID"
 echo "Tail logs: tail -f $WORKDIR/run.log"
 
-# 7. Watch for new checkpoints and sync to GDrive
+# 7. Watch for checkpoint changes and sync to GDrive immediately on update
 echo "=== Starting checkpoint watcher ==="
+LAST_SYNC=0
 while kill -0 $PID 2>/dev/null; do
     if [ -f "${OUT_DIR}/ckpt.pt" ]; then
-        rclone copy ${OUT_DIR}/ckpt.pt ${GDRIVE_REMOTE}:${OUT_DIR}/ 2>/dev/null
+        MTIME=$(stat -c %Y "${OUT_DIR}/ckpt.pt" 2>/dev/null || echo 0)
+        if [ "$MTIME" -gt "$LAST_SYNC" ]; then
+            rclone copy ${OUT_DIR}/ckpt.pt ${GDRIVE_REMOTE}:${OUT_DIR}/ 2>/dev/null
+            LAST_SYNC=$MTIME
+            echo "Checkpoint synced to GDrive at $(date)"
+        fi
     fi
-    sleep 300  # sync every 5 minutes
+    sleep 30  # check every 30 seconds
 done
-echo "Training finished."
+# Final sync on exit
+rclone copy ${OUT_DIR}/ckpt.pt ${GDRIVE_REMOTE}:${OUT_DIR}/ 2>/dev/null
+echo "Training finished. Final checkpoint synced."
